@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code web cookie auth
+After=network.target
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/python3 /usr/local/bin/claude-web-auth
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/nginx/.htpasswd-claude-code /etc/claude-code-web-auth.secret
+[Install]
+WantedBy=multi-user.target

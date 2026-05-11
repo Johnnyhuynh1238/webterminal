@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code smooth output viewer API
+After=network.target
+[Service]
+Type=simple
+User=claudeuser
+Group=claudeuser
+Environment=HOME=/home/claudeuser
+Environment=TERM=xterm-256color
+ExecStart=/usr/bin/python3 /usr/local/bin/claude-output-viewer-service
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=no
+[Install]
+WantedBy=multi-user.target

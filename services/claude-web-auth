@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, urlparse
+import crypt, hmac, hashlib, html, os, time
+HOST=os.environ.get('CLAUDE_WEB_AUTH_HOST','127.0.0.1'); PORT=int(os.environ.get('CLAUDE_WEB_AUTH_PORT','7682'))
+COOKIE_NAME=os.environ.get('CLAUDE_WEB_COOKIE_NAME','claude_code_session'); COOKIE_TTL=int(os.environ.get('CLAUDE_WEB_COOKIE_TTL',str(30*24*60*60)))
+HTPASSWD=os.environ.get('CLAUDE_WEB_HTPASSWD','/etc/nginx/.htpasswd-claude-code'); SECRET_FILE=os.environ.get('CLAUDE_WEB_SECRET_FILE','/etc/claude-code-web-auth.secret')
+def read_secret():
+    with open(SECRET_FILE,'rb') as f: return f.read().strip()
+def read_hash():
+    with open(HTPASSWD,'r',encoding='utf-8') as f: line=f.readline().strip()
+    return line.split(':',1)[1] if ':' in line else ''
+SECRET=read_secret(); PASSWORD_HASH=read_hash()
+def safe_next(v):
+    return v if v and v.startswith('/') and not v.startswith('//') and (v=='/claude' or v.startswith('/claude/') or v.startswith('/claude?')) else '/claude/'
+def sign(expiry): return hmac.new(SECRET,str(expiry).encode('ascii'),hashlib.sha256).hexdigest()
+def make_cookie():
+    expiry=int(time.time())+COOKIE_TTL; return f'{expiry}.{sign(expiry)}'
+def valid_cookie(header):
+    if not header: return False
+    cookie=SimpleCookie()
+    try: cookie.load(header); expiry_s,sig=cookie[COOKIE_NAME].value.split('.',1); expiry=int(expiry_s)
+    except Exception: return False
+    return expiry>=int(time.time()) and hmac.compare_digest(sig,sign(expiry))
+def verify_password(password):
+    try: return hmac.compare_digest(crypt.crypt(password,PASSWORD_HASH) or '', PASSWORD_HASH)
+    except Exception: return False
+def login_page(next_url,error=''):
+    err=f'<div class="error">{html.escape(error)}</div>' if error else ''
+    return f'''<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>Claude Code Login</title><style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}html,body{{margin:0;min-height:100%;background:#0b0f19;color:#f8fafc;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}body{{display:grid;place-items:center;padding:24px}}.card{{width:min(100%,420px);padding:24px;border:1px solid #243044;border-radius:18px;background:#111827;box-shadow:0 24px 80px rgba(0,0,0,.35)}}input,button{{width:100%;min-height:48px;border-radius:12px;font-size:16px}}input{{padding:12px 14px;border:1px solid #334155;background:#020617;color:#f8fafc}}button{{margin-top:16px;border:0;background:#2563eb;color:white;font-weight:700}}.error{{margin-bottom:14px;padding:10px 12px;border-radius:10px;background:#7f1d1d;color:#fee2e2}}</style></head><body><form class="card" method="post" action="/claude_login"><h1>Claude Code</h1><p>Nhập mật khẩu một lần, trình duyệt sẽ giữ phiên đăng nhập 30 ngày.</p>{err}<input type="hidden" name="next" value="{html.escape(next_url,quote=True)}"><label for="password">Mật khẩu</label><input id="password" name="password" type="password" autocomplete="current-password" autofocus required><button type="submit">Mở terminal</button></form></body></html>'''.encode('utf-8')
+class Handler(BaseHTTPRequestHandler):
+    server_version='ClaudeWebAuth/1.0'
+    def log_message(self,fmt,*args): return
+    def send_html(self,body,status=200):
+        self.send_response(status); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(body))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(body)
+    def redirect(self,target,cookie=None):
+        self.send_response(302); self.send_header('Location',target); self.send_header('Cache-Control','no-store')
+        if cookie: self.send_header('Set-Cookie',cookie)
+        self.end_headers()
+    def do_GET(self):
+        path=urlparse(self.path).path; qs=parse_qs(urlparse(self.path).query)
+        if path=='/check': self.send_response(204 if valid_cookie(self.headers.get('Cookie','')) else 401); self.end_headers(); return
+        if path=='/login':
+            n=safe_next(qs.get('next',['/claude/'])[0]); self.redirect(n) if valid_cookie(self.headers.get('Cookie','')) else self.send_html(login_page(n)); return
+        if path=='/logout': self.redirect('/claude_login',f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax'); return
+        self.send_response(404); self.end_headers()
+    def do_POST(self):
+        if urlparse(self.path).path!='/login': self.send_response(404); self.end_headers(); return
+        form=parse_qs(self.rfile.read(min(int(self.headers.get('Content-Length') or '0'),8192)).decode('utf-8','replace')); n=safe_next(form.get('next',['/claude/'])[0])
+        if not verify_password(form.get('password',[''])[0]): self.send_html(login_page(n,'Mật khẩu chưa đúng.'),401); return
+        self.redirect(n,f'{COOKIE_NAME}={make_cookie()}; Max-Age={COOKIE_TTL}; Path=/; HttpOnly; Secure; SameSite=Lax')
+if __name__=='__main__': ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()

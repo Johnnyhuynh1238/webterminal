@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME=${CLAUDE_WEB_HOME:-/home/claudeuser}
+export SHELL=${SHELL:-/bin/bash}
+export TERM=${TERM:-xterm-256color}
+export PATH=${CLAUDE_WEB_PATH:-$HOME/.nvm/versions/node/v22.22.1/bin:/usr/local/bin:/usr/bin:/bin}
+cd "$HOME"
+CLIENT_ID="${1:-default}"
+CLIENT_ID="$(printf '%s' "$CLIENT_ID" | tr -cd 'A-Za-z0-9_.-')"
+if [[ -z "$CLIENT_ID" || ${#CLIENT_ID} -gt 40 ]]; then CLIENT_ID="default"; fi
+SESSION="claude-code-web-${CLIENT_ID}"
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux new-session -d -s "$SESSION" -x "${COLUMNS:-120}" -y "${LINES:-40}" "exec bash -lc 'claude'"
+fi
+tmux set-option -t "$SESSION" -g history-limit "${CLAUDE_WEB_HISTORY_LIMIT:-50000}" >/dev/null
+tmux set-option -t "$SESSION" -g mouse on >/dev/null
+tmux set-window-option -t "$SESSION" -g mode-keys vi >/dev/null
+exec tmux attach-session -t "$SESSION"
