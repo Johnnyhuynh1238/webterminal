@@ -9,7 +9,16 @@ install -m 644 systemd/claude-code-web-auth.service /etc/systemd/system/claude-c
 install -m 644 systemd/claude-code-output-viewer.service /etc/systemd/system/claude-code-output-viewer.service
 install -d /usr/local/share/claude-code-ttyd
 install -d /usr/local/share/claude-code-ttyd/icons
-install -m 644 public/index.html /usr/local/share/claude-code-ttyd/index.html
+# index.html is the live UI — only seed it on a fresh install so re-runs
+# never clobber a customized production HTML. Delete the file or pass
+# CLAUDE_WEB_FORCE_INDEX=1 to overwrite intentionally.
+TARGET_INDEX=/usr/local/share/claude-code-ttyd/index.html
+if [[ ! -f "$TARGET_INDEX" || "${CLAUDE_WEB_FORCE_INDEX:-0}" == "1" ]]; then
+  install -m 644 public/index.html "$TARGET_INDEX"
+  echo "Installed reference index.html -> $TARGET_INDEX"
+else
+  echo "Kept existing $TARGET_INDEX (set CLAUDE_WEB_FORCE_INDEX=1 to overwrite)"
+fi
 install -m 644 public/manifest.webmanifest /usr/local/share/claude-code-ttyd/manifest.webmanifest
 install -m 644 public/sw.js /usr/local/share/claude-code-ttyd/sw.js
 install -m 644 public/icons/icon-192.png /usr/local/share/claude-code-ttyd/icons/icon-192.png
