@@ -8,7 +8,13 @@ install -m 644 systemd/claude-code-web-terminal.service /etc/systemd/system/clau
 install -m 644 systemd/claude-code-web-auth.service /etc/systemd/system/claude-code-web-auth.service
 install -m 644 systemd/claude-code-output-viewer.service /etc/systemd/system/claude-code-output-viewer.service
 install -d /usr/local/share/claude-code-ttyd
+install -d /usr/local/share/claude-code-ttyd/icons
 install -m 644 public/index.html /usr/local/share/claude-code-ttyd/index.html
+install -m 644 public/manifest.webmanifest /usr/local/share/claude-code-ttyd/manifest.webmanifest
+install -m 644 public/sw.js /usr/local/share/claude-code-ttyd/sw.js
+install -m 644 public/icons/icon-192.png /usr/local/share/claude-code-ttyd/icons/icon-192.png
+install -m 644 public/icons/icon-512.png /usr/local/share/claude-code-ttyd/icons/icon-512.png
+install -m 644 public/icons/icon-maskable-512.png /usr/local/share/claude-code-ttyd/icons/icon-maskable-512.png
 if [[ ! -f /etc/claude-code-web-auth.secret ]]; then tr -dc A-Za-z0-9 </dev/urandom | head -c 64 > /etc/claude-code-web-auth.secret; chown root:www-data /etc/claude-code-web-auth.secret; chmod 640 /etc/claude-code-web-auth.secret; fi
 systemctl daemon-reload
 systemctl enable claude-code-web-terminal claude-code-web-auth claude-code-output-viewer
