@@ -1,25 +1,1250 @@
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
-import json, os, re, subprocess, time
-HOST=os.environ.get('CLAUDE_OUTPUT_VIEWER_HOST','127.0.0.1'); PORT=int(os.environ.get('CLAUDE_OUTPUT_VIEWER_PORT','7683')); CLIENT_RE=re.compile(r'^ccw-[a-z0-9]{12}$')
-def clamp(v):
-    try: n=int(v)
-    except Exception: return 3500
-    return max(200,min(n,12000))
-def capture(client,lines):
-    if not CLIENT_RE.match(client or ''): return {'ok':False,'error':'invalid_client','output':'','ts':time.time()}
-    session=f'claude-code-web-{client}'; env=os.environ.copy(); env['HOME']=os.environ.get('CLAUDE_WEB_HOME','/home/claudeuser'); env['TERM']=env.get('TERM','xterm-256color')
-    proc=subprocess.run(['tmux','capture-pane','-p','-J','-t',f'{session}:0.0','-S',f'-{lines}','-E','-'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,timeout=3)
-    if proc.returncode: return {'ok':False,'error':proc.stderr.strip() or 'capture_failed','session':session,'output':'','ts':time.time()}
-    output='\n'.join(line.rstrip() for line in proc.stdout.replace('\x00','').splitlines()).rstrip()+'\n'
-    return {'ok':True,'session':session,'output':output,'lines':lines,'ts':time.time()}
+from urllib.parse import parse_qs, urlparse, unquote
+import json
+import os
+import re
+import subprocess
+import time
+
+HOST = '127.0.0.1'
+PORT = 7683
+CLIENT_RE = re.compile(r'^ccw-[a-z0-9]{12}$')
+HOME = os.environ.get('CLAUDE_WEB_HOME', '/home/claudeuser')
+SESSIONS_DIR = os.path.join(HOME, '.claude', 'sessions')
+PROJECTS_DIR = os.path.join(HOME, '.claude', 'projects')
+WEB_SESSIONS_DIR = os.path.join(HOME, '.claude', 'web-sessions')
+UPLOADS_DIR = os.path.join(HOME, 'uploads')
+UPLOAD_CHUNK = 1 << 16  # 64 KB
+
+ACC_HOMES_DIR = os.path.join(HOME, 'claude-homes')
+ACC_MARKER = os.path.join(ACC_HOMES_DIR, '.active')
+SWAP_TS_FILE = os.path.join(ACC_HOMES_DIR, '.last_swap_ts')
+ACC_RE = re.compile(r'^[a-z0-9_]{1,16}$')
+
+
+def read_swap_ts():
+    try:
+        with open(SWAP_TS_FILE) as fh:
+            return float(fh.read().strip())
+    except Exception:
+        return 0.0
+
+
+def bump_swap_ts():
+    try:
+        tmp = SWAP_TS_FILE + '.tmp'
+        with open(tmp, 'w') as fh:
+            fh.write(f'{time.time():.6f}\n')
+        os.replace(tmp, SWAP_TS_FILE)
+    except Exception:
+        pass
+
+
+def get_active_acc():
+    try:
+        with open(ACC_MARKER) as fh:
+            name = fh.read().strip()
+        if name and ACC_RE.match(name):
+            return name
+    except Exception:
+        pass
+    return None
+
+
+def get_active_home():
+    acc = get_active_acc()
+    if acc:
+        cand = os.path.join(ACC_HOMES_DIR, acc)
+        if os.path.isdir(os.path.join(cand, '.claude')):
+            return cand
+    return HOME
+
+
+def acc_has_creds(acc):
+    if not ACC_RE.match(acc or ''):
+        return False
+    return os.path.isfile(os.path.join(ACC_HOMES_DIR, acc, '.claude', '.credentials.json'))
+
+_RENDER_CACHE = {}  # jsonl_path -> (mtime, size, rendered_text)
+
+
+def tmux_env():
+    env = os.environ.copy()
+    env['HOME'] = get_active_home()
+    env['TERM'] = env.get('TERM', 'xterm-256color')
+    return env
+
+
+def clamp_lines(value):
+    try:
+        lines = int(value)
+    except Exception:
+        return 3500
+    return max(200, min(lines, 12000))
+
+
+def session_target(client_id):
+    return f'claude-code-web-{client_id}:0.0'
+
+
+def ensure_valid_client(client_id):
+    return bool(CLIENT_RE.match(client_id or ''))
+
+
+def read_comm(pid):
+    try:
+        with open(f'/proc/{pid}/comm') as fh:
+            return fh.read().strip()
+    except Exception:
+        return None
+
+
+def find_claude_pid(client_id):
+    target = session_target(client_id)
+    try:
+        pane_pid = subprocess.check_output(
+            ['tmux', 'display-message', '-p', '-t', target, '#{pane_pid}'],
+            text=True, env=tmux_env(), timeout=2
+        ).strip()
+    except Exception:
+        return None
+    if not pane_pid or not pane_pid.isdigit():
+        return None
+    if read_comm(pane_pid) == 'claude':
+        return pane_pid
+    try:
+        out = subprocess.check_output(['pgrep', '-P', pane_pid, '-x', 'claude'], text=True, timeout=2).strip()
+        if out:
+            return out.split('\n')[0]
+    except subprocess.CalledProcessError:
+        pass
+    except Exception:
+        return None
+    return None
+
+
+def find_jsonl_for_session(client_id):
+    pid = find_claude_pid(client_id)
+    if not pid:
+        return None
+    session_file = os.path.join(SESSIONS_DIR, f'{pid}.json')
+    if not os.path.isfile(session_file):
+        return None
+    try:
+        with open(session_file) as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    session_id = data.get('sessionId')
+    cwd = data.get('cwd')
+    if not session_id or not cwd:
+        return None
+    proj_name = cwd.replace('/', '-')
+    return os.path.join(PROJECTS_DIR, proj_name, f'{session_id}.jsonl')
+
+
+def _flatten_text_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                parts.append(item.get('text', ''))
+        return '\n'.join(parts)
+    return ''
+
+
+def _tool_input_summary(inp):
+    if not isinstance(inp, dict):
+        return ''
+    keys = ['file_path', 'path', 'command', 'description', 'pattern', 'url', 'query', 'prompt']
+    for k in keys:
+        if k in inp:
+            v = inp[k]
+            if isinstance(v, str):
+                return f'{k}: {v[:160]}'
+    try:
+        return json.dumps(inp, ensure_ascii=False)[:200]
+    except Exception:
+        return ''
+
+
+def render_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                etype = event.get('type')
+                if etype == 'user':
+                    msg = event.get('message') or {}
+                    content = msg.get('content')
+                    if isinstance(content, str):
+                        out.append('━━━━━━ Bạn ━━━━━━')
+                        out.append(content)
+                        out.append('')
+                    elif isinstance(content, list):
+                        text_parts = []
+                        tool_results = []
+                        for item in content:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get('type') == 'text':
+                                text_parts.append(item.get('text', ''))
+                            elif item.get('type') == 'tool_result':
+                                tc = item.get('content', '')
+                                if isinstance(tc, list):
+                                    tc = '\n'.join(
+                                        it.get('text', '') for it in tc
+                                        if isinstance(it, dict) and it.get('type') == 'text'
+                                    )
+                                if tc:
+                                    tool_results.append(str(tc))
+                        if text_parts:
+                            out.append('━━━━━━ Bạn ━━━━━━')
+                            out.append('\n'.join(text_parts))
+                            out.append('')
+                        for tr in tool_results:
+                            preview = tr if len(tr) <= 600 else tr[:600] + '… (cắt)'
+                            out.append('  ⎿ kết quả:')
+                            for line in preview.split('\n'):
+                                out.append('     ' + line)
+                            out.append('')
+                elif etype == 'assistant':
+                    msg = event.get('message') or {}
+                    content = msg.get('content') or []
+                    if not isinstance(content, list):
+                        continue
+                    text_parts = []
+                    tool_calls = []
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        t = item.get('type')
+                        if t == 'text':
+                            text_parts.append(item.get('text', ''))
+                        elif t == 'tool_use':
+                            name = item.get('name', '?')
+                            summary = _tool_input_summary(item.get('input'))
+                            tool_calls.append((name, summary))
+                    if text_parts:
+                        out.append('━━━━━━ Claude ━━━━━━')
+                        out.append('\n'.join(p for p in text_parts if p))
+                        out.append('')
+                    for name, summary in tool_calls:
+                        if summary:
+                            out.append(f'● {name}  ({summary})')
+                        else:
+                            out.append(f'● {name}')
+                    if tool_calls:
+                        out.append('')
+    except Exception as exc:
+        out.append(f'[lỗi đọc transcript: {exc}]')
+    return '\n'.join(out).rstrip() + '\n'
+
+
+
+def render_jsonl_struct(path):
+    """Parse JSONL into a list of structured message dicts for rich rendering."""
+    messages = []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                etype = event.get('type')
+                ts = event.get('timestamp') or event.get('ts') or 0
+                if etype == 'user':
+                    msg = event.get('message') or {}
+                    content = msg.get('content')
+                    text_parts = []
+                    tool_results = []
+                    if isinstance(content, str):
+                        text_parts.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if not isinstance(item, dict):
+                                continue
+                            t = item.get('type')
+                            if t == 'text':
+                                text_parts.append(item.get('text', ''))
+                            elif t == 'tool_result':
+                                tc = item.get('content', '')
+                                if isinstance(tc, list):
+                                    tc = '\n'.join(
+                                        it.get('text', '') for it in tc
+                                        if isinstance(it, dict) and it.get('type') == 'text'
+                                    )
+                                tool_results.append({
+                                    'tool_use_id': item.get('tool_use_id'),
+                                    'content': str(tc or ''),
+                                    'is_error': bool(item.get('is_error', False)),
+                                })
+                    user_text = '\n'.join(p for p in text_parts if p)
+                    if user_text:
+                        messages.append({
+                            'role': 'user',
+                            'ts': ts,
+                            'text': user_text,
+                        })
+                    for tr in tool_results:
+                        messages.append({
+                            'role': 'tool_result',
+                            'ts': ts,
+                            'content': tr['content'],
+                            'tool_use_id': tr['tool_use_id'],
+                            'is_error': tr['is_error'],
+                        })
+                elif etype == 'assistant':
+                    msg = event.get('message') or {}
+                    content = msg.get('content') or []
+                    if not isinstance(content, list):
+                        continue
+                    text_parts = []
+                    tool_calls = []
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        t = item.get('type')
+                        if t == 'text':
+                            text_parts.append(item.get('text', ''))
+                        elif t == 'tool_use':
+                            tool_calls.append({
+                                'id': item.get('id'),
+                                'name': item.get('name', '?'),
+                                'input': item.get('input') or {},
+                            })
+                    asst_text = '\n'.join(p for p in text_parts if p)
+                    if asst_text:
+                        messages.append({
+                            'role': 'assistant',
+                            'ts': ts,
+                            'text': asst_text,
+                        })
+                    for tc in tool_calls:
+                        messages.append({
+                            'role': 'tool_call',
+                            'ts': ts,
+                            'name': tc['name'],
+                            'input': tc['input'],
+                            'id': tc['id'],
+                        })
+    except Exception as exc:
+        messages.append({'role': 'error', 'text': f'lỗi đọc transcript: {exc}'})
+    return messages
+
+
+_STRUCT_CACHE = {}  # jsonl_path -> ((mtime_ns, size), messages)
+
+
+def render_jsonl_struct_cached(path):
+    try:
+        st = os.stat(path)
+    except Exception:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _STRUCT_CACHE.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    rendered = render_jsonl_struct(path)
+    _STRUCT_CACHE[path] = (key, rendered)
+    return rendered
+
+
+def capture_struct(client_id):
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'messages': [], 'ts': time.time()}
+    busy = detect_busy(client_id)
+    jsonl = find_jsonl_for_session(client_id)
+    messages = []
+    if jsonl and os.path.isfile(jsonl):
+        messages = render_jsonl_struct_cached(jsonl) or []
+    tmux_tail = capture_from_tmux(client_id, 60) or ''
+    tail_lines = tmux_tail.rstrip('\n').split('\n')[-8:] if tmux_tail else []
+    return {
+        'ok': True,
+        'messages': messages,
+        'tmux_tail': '\n'.join(tail_lines),
+        'busy': busy,
+        'ts': time.time(),
+    }
+
+
+def render_jsonl_cached(path):
+    try:
+        st = os.stat(path)
+    except Exception:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _RENDER_CACHE.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    rendered = render_jsonl(path)
+    _RENDER_CACHE[path] = (key, rendered)
+    return rendered
+
+
+def capture_from_tmux(client_id, lines):
+    target = session_target(client_id)
+    cmd = ['tmux', 'capture-pane', '-p', '-J', '-t', target, '-S', f'-{lines}', '-E', '-']
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=tmux_env(), timeout=3)
+    if proc.returncode != 0:
+        return None
+    output = proc.stdout.replace('\x00', '')
+    output = '\n'.join(line.rstrip() for line in output.splitlines()).rstrip() + '\n'
+    return output
+
+
+_BUSY_HINTS = (
+    re.compile(r'esc to interrupt', re.IGNORECASE),
+    # Spinner line, two known shapes:
+    #   "✻ Evaporating… (4m 23s · thought for 2s)"  (countdown)
+    #   "✽ Canoodling… (almost done thinking)"      (text-only paren)
+    # Verb ends with horizontal ellipsis (U+2026) followed by an open paren.
+    # The completion summary uses "Verbed for Xs" — no ellipsis — so this
+    # only matches live spinners.
+    re.compile(r'…\s*\('),
+    re.compile(r'still (thinking|rendering|working|generating)', re.IGNORECASE),
+    re.compile(r'running\s+\d+\s+(shell|tool)', re.IGNORECASE),
+)
+
+# Completion line e.g. "✻ Brewed for 47s" / "✻ Churned for 1m 31s".
+# Past-tense verb + "for <duration>" with no horizontal ellipsis.
+_DONE_HINT = re.compile(r'\b\w+ed\s+for\s+\d+\s*[ms]')
+
+_BUSY_STICKY_S = 8.0  # keep "busy" sticky for this many seconds after last positive hit
+_JSONL_FRESH_S = 3.0  # JSONL mtime newer than this many seconds ago counts as busy
+_BUSY_STATE = {}  # client_id -> last_busy_ts
+
+
+def _scan_pane_for_busy(client_id):
+    target = session_target(client_id)
+    if not target:
+        return False, False
+    try:
+        proc = subprocess.run(
+            ['tmux', 'capture-pane', '-p', '-J', '-t', target],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env=tmux_env(), timeout=2,
+        )
+    except Exception:
+        return False, False
+    if proc.returncode != 0:
+        return False, False
+    pane = proc.stdout or ''
+    # Scan the WHOLE visible pane — spinner can sit far above the input box
+    # when tool output is long. False positives from history are negligible
+    # because the patterns are specific (horizontal ellipsis + paren + digits).
+    busy = any(rx.search(pane) for rx in _BUSY_HINTS)
+    done = bool(_DONE_HINT.search(pane)) and not busy
+    return busy, done
+
+
+def detect_busy(client_id):
+    now = time.time()
+    raw_busy, done_marker = _scan_pane_for_busy(client_id)
+    # Backup signal: JSONL transcript was written to very recently → Claude is
+    # actively producing tokens even if the spinner glyph briefly scrolled off.
+    if not raw_busy:
+        jsonl = find_jsonl_for_session(client_id)
+        if jsonl and os.path.isfile(jsonl):
+            try:
+                if now - os.path.getmtime(jsonl) < _JSONL_FRESH_S:
+                    raw_busy = True
+            except Exception:
+                pass
+    if raw_busy:
+        _BUSY_STATE[client_id] = now
+        return True
+    # Explicit "Verbed for Xs" completion line breaks sticky immediately,
+    # rather than waiting out the hysteresis window.
+    if done_marker:
+        _BUSY_STATE.pop(client_id, None)
+        return False
+    # Hysteresis: prevent flapping during brief idle blips between tool calls.
+    last = _BUSY_STATE.get(client_id)
+    if last and now - last < _BUSY_STICKY_S:
+        return True
+    return False
+
+
+def capture(client_id, lines):
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'output': '', 'ts': time.time()}
+    busy = detect_busy(client_id)
+    # Claude's TUI uses the alternate screen, so tmux's scrollback buffer is
+    # empty — the pane only holds the current visible frame (~40 lines).
+    # JSONL transcript is the only source of real conversation history.
+    # Strategy: render JSONL for the full history, then append only the BOTTOM
+    # few rows of the tmux pane so the user sees claude's input box / status
+    # footer without duplicating the conversation output (which already lives
+    # in the JSONL history above).
+    LIVE_TAIL_LINES = 8
+    history = ''
+    jsonl = find_jsonl_for_session(client_id)
+    if jsonl and os.path.isfile(jsonl):
+        history = render_jsonl_cached(jsonl) or ''
+    live_full = capture_from_tmux(client_id, lines) or ''
+    if live_full:
+        live_rows = live_full.rstrip('\n').split('\n')
+        live = '\n'.join(live_rows[-LIVE_TAIL_LINES:]).rstrip() + '\n'
+    else:
+        live = ''
+    if history and live:
+        sep = '\n' + ('─' * 30) + ' Terminal trực tiếp ' + ('─' * 30) + '\n'
+        output = history.rstrip() + sep + live
+        source = 'jsonl+tmux-tail'
+    elif live:
+        output = live
+        source = 'tmux'
+    elif history:
+        output = history
+        source = 'jsonl'
+    else:
+        return {'ok': False, 'error': 'capture_failed', 'output': '', 'ts': time.time()}
+    all_lines = output.split('\n')
+    if len(all_lines) > lines:
+        all_lines = all_lines[-lines:]
+    output = '\n'.join(all_lines).rstrip() + '\n'
+    return {'ok': True, 'output': output, 'lines': lines, 'source': source, 'busy': busy, 'ts': time.time()}
+
+
+def spawn_claude_session(client_id, env):
+    # Mirrors /usr/local/bin/claude-web-terminal so a backend-spawned session
+    # behaves the same as one started by ttyd's WebSocket upgrade.
+    # `-e HOME=...` pins HOME per session — tmux's long-running server otherwise
+    # reuses its own initial env and ignores subprocess env, which breaks acc isolation.
+    session = f'claude-code-web-{client_id}'
+    new_session = subprocess.run(
+        ['tmux', 'new-session', '-d', '-s', session, '-e', f"HOME={env.get('HOME', HOME)}",
+         '-x', '120', '-y', '40', "exec bash -lc 'claude'"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=5
+    )
+    if new_session.returncode != 0:
+        return {'ok': False, 'error': 'spawn_failed', 'detail': (new_session.stderr or b'').decode('utf-8', 'replace').strip()}
+    for opt in (
+        ['set-option', '-t', session, '-g', 'history-limit', '50000'],
+        ['set-option', '-t', session, '-g', 'mouse', 'on'],
+        ['set-window-option', '-t', session, '-g', 'mode-keys', 'vi'],
+    ):
+        try:
+            subprocess.run(['tmux'] + opt, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=2)
+        except Exception:
+            pass
+    return {'ok': True}
+
+
+def send_input(client_id, text):
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'ts': time.time()}
+    if not isinstance(text, str):
+        return {'ok': False, 'error': 'invalid_text', 'ts': time.time()}
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    if len(text) > 100000:
+        return {'ok': False, 'error': 'text_too_large', 'ts': time.time()}
+    if not text.strip():
+        return {'ok': False, 'error': 'empty_text', 'ts': time.time()}
+
+    target = session_target(client_id)
+    env = tmux_env()
+    session_name = target.split(':')[0]
+
+    has = subprocess.run(['tmux', 'has-session', '-t', session_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=3)
+    respawned = False
+    if has.returncode != 0:
+        spawn_result = spawn_claude_session(client_id, env)
+        if not spawn_result.get('ok'):
+            return {'ok': False, 'error': spawn_result.get('error', 'spawn_failed'), 'detail': spawn_result.get('detail', ''), 'ts': time.time()}
+        respawned = True
+        # Let claude attach to the new pty before flushing keys; otherwise the
+        # leading characters race the shell's pre-exec state.
+        time.sleep(1.5)
+
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        subprocess.run(['tmux', 'send-keys', '-t', target, '-l', line], check=True, env=env, timeout=3)
+        if i < len(lines) - 1:
+            subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'], check=True, env=env, timeout=3)
+    subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'], check=True, env=env, timeout=3)
+    return {'ok': True, 'sentLines': len(lines), 'respawned': respawned, 'ts': time.time()}
+
+
+def list_sessions():
+    env = tmux_env()
+    proc = subprocess.run(
+        ['tmux', 'list-sessions', '-F',
+         '#{session_name}|#{session_created}|#{session_attached}|#{session_windows}'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=3
+    )
+    sessions = []
+    if proc.returncode == 0:
+        prefix = 'claude-code-web-'
+        for line in proc.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) < 4:
+                continue
+            name, created, attached, windows = parts
+            if not name.startswith(prefix):
+                continue
+            client_id = name[len(prefix):]
+            if not CLIENT_RE.match(client_id):
+                continue
+            try:
+                created_i = int(created)
+            except Exception:
+                created_i = 0
+            try:
+                attached_i = int(attached)
+            except Exception:
+                attached_i = 0
+            sessions.append({
+                'client_id': client_id,
+                'created': created_i,
+                'attached': attached_i,
+                'windows': int(windows) if windows.isdigit() else 1,
+            })
+    sessions.sort(key=lambda s: s['created'])
+    # Warm the per-client UUID cache opportunistically. The panel polls /sessions
+    # often, so this keeps cached UUIDs fresh while claude is alive — and reset
+    # can fall back to the cache after claude crashes (pid.json gone).
+    for s in sessions:
+        try:
+            get_session_id_for_client(s['client_id'])
+        except Exception:
+            pass
+    return {'ok': True, 'sessions': sessions, 'ts': time.time()}
+
+
+def kill_session(client_id):
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'ts': time.time()}
+    target = 'claude-code-web-' + client_id
+    env = tmux_env()
+    proc = subprocess.run(
+        ['tmux', 'kill-session', '-t', target],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=3
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or '').strip()
+        if "can't find session" in stderr or 'no server running' in stderr:
+            return {'ok': False, 'error': 'not_found', 'ts': time.time()}
+        return {'ok': False, 'error': stderr or 'kill_failed', 'ts': time.time()}
+    return {'ok': True, 'client_id': client_id, 'ts': time.time()}
+
+
+_SESSION_ID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+def _cache_path_for_client(client_id):
+    return os.path.join(WEB_SESSIONS_DIR, f'{client_id}.json')
+
+
+def cache_session_id(client_id, session_id):
+    """Persist the last-known sessionId for this client_id so reset can resume
+    even after claude has crashed (pid.json gone). Best-effort; failures ignored."""
+    if not session_id or not _SESSION_ID_RE.match(session_id):
+        return
+    try:
+        os.makedirs(WEB_SESSIONS_DIR, exist_ok=True)
+        tmp = _cache_path_for_client(client_id) + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump({'sessionId': session_id, 'ts': time.time()}, fh)
+        os.replace(tmp, _cache_path_for_client(client_id))
+    except Exception:
+        pass
+
+
+def load_cached_session_id(client_id):
+    try:
+        with open(_cache_path_for_client(client_id)) as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    sid = data.get('sessionId') if isinstance(data, dict) else None
+    if isinstance(sid, str) and _SESSION_ID_RE.match(sid):
+        return sid
+    return None
+
+
+def get_session_id_for_client(client_id):
+    """Return Claude's session UUID for this tmux session, or None.
+
+    Claude Code writes ~/.claude/sessions/<pid>.json with sessionId + cwd while
+    a claude process is alive. We resolve pid via tmux pane → read that file.
+    When pid.json is gone (claude crashed / between processes), fall back to
+    the cached UUID from the last time we observed a live session for this client.
+    """
+    pid = find_claude_pid(client_id)
+    if pid:
+        session_file = os.path.join(SESSIONS_DIR, f'{pid}.json')
+        if os.path.isfile(session_file):
+            try:
+                with open(session_file) as fh:
+                    data = json.load(fh)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                sid = data.get('sessionId')
+                if isinstance(sid, str) and _SESSION_ID_RE.match(sid):
+                    cache_session_id(client_id, sid)
+                    return sid
+    # Live lookup failed — fall back to last-known UUID for this client.
+    return load_cached_session_id(client_id)
+
+
+def reset_session(client_id):
+    """Kill the tmux session if it exists, then recreate it resuming the same
+    Claude conversation via `claude --resume <session-id>` when known.
+
+    Falls back to `claude --continue` if we can't determine the per-session UUID
+    (e.g. claude crashed before reset, or no <pid>.json file).
+    """
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'ts': time.time()}
+    target = 'claude-code-web-' + client_id
+    env = tmux_env()
+
+    # Step 1: capture the session UUID BEFORE we kill — pid.json goes away with claude.
+    session_id = get_session_id_for_client(client_id)
+
+    # Only use --resume if the conversation file actually exists. A brand-new
+    # claude session writes pid.json with a sessionId BEFORE creating the .jsonl,
+    # so a UUID with no .jsonl makes --resume bail with "No conversation found".
+    has_jsonl = False
+    if session_id:
+        jsonl_path = os.path.join(PROJECTS_DIR, '-home-claudeuser', f'{session_id}.jsonl')
+        has_jsonl = os.path.isfile(jsonl_path)
+
+    # Step 2: kill existing session (ignore "not found" — it's fine to recreate).
+    kill_proc = subprocess.run(
+        ['tmux', 'kill-session', '-t', target],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, timeout=3
+    )
+    if kill_proc.returncode != 0:
+        stderr = (kill_proc.stderr or '').strip()
+        if not ("can't find session" in stderr or 'no server running' in stderr):
+            return {'ok': False, 'error': stderr or 'kill_failed', 'ts': time.time()}
+
+    # Step 3: build a chained command so a failing --resume falls back to --continue
+    # then to plain `claude`. Without the chain, any failure exits bash and the
+    # tmux pane dies — user reload then lands in entry-script's "fresh claude" path.
+    if session_id and has_jsonl:
+        # Both UUID and .jsonl present → safe to resume this exact conversation.
+        # Chain to claude (fresh) only as a last resort; never to --continue which
+        # could pull an unrelated session's history.
+        claude_cmd = f'claude --resume {session_id} || claude'
+        resume_mode = 'resume'
+    else:
+        # Either no UUID or no .jsonl on disk → nothing meaningful to resume.
+        # Start fresh rather than --continue, which would silently attach to some
+        # unrelated recent conversation.
+        claude_cmd = 'claude'
+        resume_mode = 'fresh'
+    # NOTE: use single quotes around the inner bash arg. With double quotes the
+    # outer /bin/sh that tmux invokes was eating `||` parsing and the fallback
+    # branch never reached `claude --resume`.
+    # cwd MUST be HOME — claude --resume locates the .jsonl via cwd-encoded project
+    # dir (`-home-claudeuser/<uuid>.jsonl`). Without cwd it silently starts fresh.
+    # `-e HOME=...` pins HOME per session (tmux server's inherited env wins otherwise);
+    # cwd / -c stay on the master HOME so the JSONL project slug remains "-home-claudeuser".
+    new_proc = subprocess.run(
+        ['tmux', 'new-session', '-d', '-s', target,
+         '-e', f"HOME={env.get('HOME', HOME)}",
+         '-x', '120', '-y', '40', '-c', HOME,
+         "bash -lc '" + claude_cmd + "'"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=HOME, timeout=5
+    )
+    if new_proc.returncode != 0:
+        return {'ok': False, 'error': (new_proc.stderr or '').strip() or 'create_failed', 'ts': time.time()}
+
+    return {
+        'ok': True,
+        'client_id': client_id,
+        'session_id': session_id,
+        'mode': resume_mode,
+        'has_jsonl': has_jsonl,
+        'ts': time.time(),
+    }
+
+
+def list_accs():
+    items = []
+    try:
+        for entry in os.scandir(ACC_HOMES_DIR):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if not ACC_RE.match(entry.name):
+                continue
+            items.append({
+                'name': entry.name,
+                'has_creds': acc_has_creds(entry.name),
+            })
+    except Exception:
+        pass
+    items.sort(key=lambda x: x['name'])
+    return items
+
+
+def acc_status():
+    return {
+        'ok': True,
+        'active': get_active_acc(),
+        'accs': list_accs(),
+        'swap_ts': read_swap_ts(),
+        'ts': time.time(),
+    }
+
+
+def swap_acc(client_id, target=None):
+    if not ensure_valid_client(client_id):
+        return {'ok': False, 'error': 'invalid_client', 'ts': time.time()}
+    cur = get_active_acc()
+    accs = [a['name'] for a in list_accs()]
+    if not accs:
+        return {'ok': False, 'error': 'no_accs_configured', 'ts': time.time()}
+    if target:
+        if not ACC_RE.match(target) or target not in accs:
+            return {'ok': False, 'error': 'invalid_target', 'ts': time.time()}
+        new = target
+    else:
+        # Toggle: pick the first acc that isn't current. With 2 accs this is the other one.
+        others = [a for a in accs if a != cur]
+        if not others:
+            return {'ok': False, 'error': 'no_other_acc', 'ts': time.time()}
+        new = others[0]
+    if new == cur:
+        return {'ok': False, 'error': 'already_active', 'active': cur, 'ts': time.time()}
+    new_dir = os.path.join(ACC_HOMES_DIR, new, '.claude')
+    if not os.path.isdir(new_dir):
+        return {'ok': False, 'error': f'acc_not_setup:{new}', 'ts': time.time()}
+    # Persist marker BEFORE reset so reset's tmux_env() picks up the new HOME.
+    tmp = ACC_MARKER + '.tmp'
+    try:
+        with open(tmp, 'w') as fh:
+            fh.write(new + '\n')
+        os.replace(tmp, ACC_MARKER)
+    except Exception as exc:
+        return {'ok': False, 'error': f'marker_write_failed:{exc}', 'ts': time.time()}
+    # Reset the tmux session — entrypoint/reset will spawn with new HOME.
+    reset_result = reset_session(client_id)
+    reset_result['swapped_from'] = cur
+    reset_result['swapped_to'] = new
+    reset_result['needs_login'] = not acc_has_creds(new)
+    return reset_result
+
+def swap_acc_all(caller_client_id, target=None):
+    """Swap active acc AND reset every live claude-code-web tmux session.
+
+    Unlike swap_acc which only resets the caller's session, this also kills
+    and re-spawns sibling sessions so they pick up the new HOME.
+    """
+    if not ensure_valid_client(caller_client_id):
+        return {'ok': False, 'error': 'invalid_client', 'ts': time.time()}
+    cur = get_active_acc()
+    accs = [a['name'] for a in list_accs()]
+    if not accs:
+        return {'ok': False, 'error': 'no_accs_configured', 'ts': time.time()}
+    if target:
+        if not ACC_RE.match(target) or target not in accs:
+            return {'ok': False, 'error': 'invalid_target', 'ts': time.time()}
+        new = target
+    else:
+        others = [a for a in accs if a != cur]
+        if not others:
+            return {'ok': False, 'error': 'no_other_acc', 'ts': time.time()}
+        new = others[0]
+    if new == cur:
+        return {'ok': False, 'error': 'already_active', 'active': cur, 'ts': time.time()}
+    new_dir = os.path.join(ACC_HOMES_DIR, new, '.claude')
+    if not os.path.isdir(new_dir):
+        return {'ok': False, 'error': f'acc_not_setup:{new}', 'ts': time.time()}
+    pre = list_sessions()
+    clients = [s['client_id'] for s in pre.get('sessions', [])]
+    if caller_client_id not in clients:
+        clients.append(caller_client_id)
+    tmp = ACC_MARKER + '.tmp'
+    try:
+        with open(tmp, 'w') as fh:
+            fh.write(new + '\n')
+        os.replace(tmp, ACC_MARKER)
+    except Exception as exc:
+        return {'ok': False, 'error': f'marker_write_failed:{exc}', 'ts': time.time()}
+    bump_swap_ts()
+    results = []
+    for cid in clients:
+        try:
+            r = reset_session(cid)
+        except Exception as exc:
+            r = {'ok': False, 'error': str(exc)}
+        results.append({
+            'client_id': cid,
+            'ok': bool(r.get('ok')),
+            'mode': r.get('mode'),
+            'error': r.get('error'),
+        })
+    return {
+        'ok': True,
+        'swapped_from': cur,
+        'swapped_to': new,
+        'needs_login': not acc_has_creds(new),
+        'sessions': results,
+        'total': len(results),
+        'ts': time.time(),
+    }
+
+
+def safe_basename(name):
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name or name in ('.', '..'):
+        return None
+    # Reject any path-like input upfront (no silent basename normalization).
+    if '\x00' in name or '/' in name or '\\' in name:
+        return None
+    if any(ord(c) < 32 for c in name):
+        return None
+    if os.path.basename(name) != name:
+        return None
+    if len(name.encode('utf-8')) > 255:
+        return None
+    return name
+
+
+def upload_path(name):
+    base = safe_basename(name)
+    if base is None:
+        return None
+    full = os.path.realpath(os.path.join(UPLOADS_DIR, base))
+    root = os.path.realpath(UPLOADS_DIR)
+    if full != os.path.join(root, base):
+        return None
+    return full
+
+
+def ensure_uploads_dir():
+    try:
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def list_uploads():
+    ensure_uploads_dir()
+    items = []
+    try:
+        for entry in os.scandir(UPLOADS_DIR):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                st = entry.stat()
+            except Exception:
+                continue
+            items.append({
+                'name': entry.name,
+                'size': st.st_size,
+                'mtime': int(st.st_mtime),
+            })
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc), 'items': [], 'ts': time.time()}
+    items.sort(key=lambda x: x['mtime'], reverse=True)
+    return {'ok': True, 'items': items, 'dir': UPLOADS_DIR, 'ts': time.time()}
+
+
+def save_upload_stream(rfile, length, target_path):
+    tmp_path = f'{target_path}.part-{os.getpid()}-{int(time.time() * 1000)}'
+    written = 0
+    try:
+        with open(tmp_path, 'wb') as out:
+            remaining = length
+            while remaining > 0:
+                chunk_size = min(UPLOAD_CHUNK, remaining)
+                data = rfile.read(chunk_size)
+                if not data:
+                    break
+                out.write(data)
+                written += len(data)
+                remaining -= len(data)
+        if written != length:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return False, f'incomplete:{written}/{length}'
+        os.replace(tmp_path, target_path)
+        return True, written
+    except Exception as exc:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return False, str(exc)
+
+
+def delete_upload(name):
+    p = upload_path(name)
+    if p is None:
+        return {'ok': False, 'error': 'invalid_name', 'ts': time.time()}
+    if not os.path.isfile(p):
+        return {'ok': False, 'error': 'not_found', 'ts': time.time()}
+    try:
+        os.unlink(p)
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc), 'ts': time.time()}
+    return {'ok': True, 'name': name, 'ts': time.time()}
+
+
+def rename_upload(old, new):
+    src = upload_path(old)
+    dst = upload_path(new)
+    if src is None or dst is None:
+        return {'ok': False, 'error': 'invalid_name', 'ts': time.time()}
+    if not os.path.isfile(src):
+        return {'ok': False, 'error': 'not_found', 'ts': time.time()}
+    if src == dst:
+        return {'ok': True, 'name': safe_basename(new), 'ts': time.time()}
+    if os.path.exists(dst):
+        return {'ok': False, 'error': 'target_exists', 'ts': time.time()}
+    try:
+        os.rename(src, dst)
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc), 'ts': time.time()}
+    return {'ok': True, 'name': safe_basename(new), 'ts': time.time()}
+
+
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self,fmt,*args): return
-    def send_json(self,payload,status=200):
-        body=json.dumps(payload,ensure_ascii=False).encode('utf-8'); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    server_version = 'ClaudeOutputViewer/1.3'
+
+    def log_message(self, fmt, *args):
+        return
+
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+        except ConnectionResetError:
+            pass
+
     def do_GET(self):
-        parsed=urlparse(self.path)
-        if parsed.path!='/capture': self.send_json({'ok':False,'error':'not_found'},404); return
-        qs=parse_qs(parsed.query); self.send_json(capture(qs.get('client',[''])[0],clamp(qs.get('lines',['3500'])[0])))
-if __name__=='__main__': ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == '/capture_struct':
+            qs = parse_qs(parsed.query)
+            client_id = qs.get('client', [''])[0]
+            try:
+                payload = capture_struct(client_id)
+                status = 200 if payload.get('ok') else (400 if payload.get('error') == 'invalid_client' else 500)
+                self.send_json(payload, status)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'messages': [], 'ts': time.time()}, 500)
+            return
+        if path == '/capture':
+            qs = parse_qs(parsed.query)
+            try:
+                payload = capture(qs.get('client', [''])[0], clamp_lines(qs.get('lines', ['3500'])[0]))
+                self.send_json(payload, 200 if payload.get('ok') else 404)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'capture_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/files':
+            try:
+                self.send_json(list_uploads(), 200)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/sessions':
+            try:
+                self.send_json(list_sessions(), 200)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'list_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/acc_status':
+            try:
+                self.send_json(acc_status(), 200)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        self.send_json({'ok': False, 'error': 'not_found'}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == '/send':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 120000)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                try:
+                    with open('/tmp/claude-send.log', 'a') as _lf:
+                        _lf.write('%s client=%r text=%r origin=%r ref=%r\n' % (time.strftime('%H:%M:%S'), data.get('client',''), (data.get('text','') or '')[:60], self.headers.get('Origin',''), self.headers.get('Referer','')))
+                except Exception:
+                    pass
+                payload = send_input(data.get('client', ''), data.get('text', ''))
+                self.send_json(payload, 200 if payload.get('ok') else 400)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'send_timeout', 'ts': time.time()}, 504)
+            except subprocess.CalledProcessError as exc:
+                self.send_json({'ok': False, 'error': f'send_failed:{exc.returncode}', 'ts': time.time()}, 500)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/upload':
+            try:
+                ensure_uploads_dir()
+                qs = parse_qs(parsed.query)
+                raw_name = unquote(self.headers.get('X-Filename') or qs.get('name', [''])[0] or '')
+                overwrite = (self.headers.get('X-Overwrite') or qs.get('overwrite', [''])[0] or '').lower() in ('1', 'true', 'yes')
+                target = upload_path(raw_name)
+                if target is None:
+                    self.send_json({'ok': False, 'error': 'invalid_name', 'ts': time.time()}, 400)
+                    return
+                length_header = self.headers.get('Content-Length')
+                if length_header is None:
+                    self.send_json({'ok': False, 'error': 'missing_content_length', 'ts': time.time()}, 411)
+                    return
+                try:
+                    length = int(length_header)
+                except Exception:
+                    self.send_json({'ok': False, 'error': 'bad_content_length', 'ts': time.time()}, 400)
+                    return
+                if length < 0:
+                    self.send_json({'ok': False, 'error': 'bad_content_length', 'ts': time.time()}, 400)
+                    return
+                if (not overwrite) and os.path.exists(target):
+                    self.send_json({'ok': False, 'error': 'exists', 'ts': time.time()}, 409)
+                    return
+                ok, info = save_upload_stream(self.rfile, length, target)
+                if not ok:
+                    self.send_json({'ok': False, 'error': f'save_failed:{info}', 'ts': time.time()}, 500)
+                    return
+                self.send_json({'ok': True, 'name': os.path.basename(target), 'size': info, 'ts': time.time()}, 200)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/rename':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 8192)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                payload = rename_upload(data.get('old', ''), data.get('new', ''))
+                self.send_json(payload, 200 if payload.get('ok') else 400)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/kill':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 4096)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                payload = kill_session(data.get('client', ''))
+                status_map = {'invalid_client': 400, 'not_found': 404}
+                status = 200 if payload.get('ok') else status_map.get(payload.get('error'), 500)
+                self.send_json(payload, status)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'kill_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/reset':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 4096)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                payload = reset_session(data.get('client', ''))
+                status = 200 if payload.get('ok') else (400 if payload.get('error') == 'invalid_client' else 500)
+                self.send_json(payload, status)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'reset_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/swap_acc_all':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 4096)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                payload = swap_acc_all(data.get('client', ''), data.get('target'))
+                err = payload.get('error', '') or ''
+                if payload.get('ok'):
+                    status = 200
+                elif err in ('invalid_client', 'invalid_target', 'already_active'):
+                    status = 400
+                elif err.startswith('acc_not_setup'):
+                    status = 404
+                else:
+                    status = 500
+                self.send_json(payload, status)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'swap_all_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        if path == '/swap_acc':
+            try:
+                length = int(self.headers.get('Content-Length') or '0')
+                raw = self.rfile.read(min(length, 4096)).decode('utf-8', 'replace')
+                data = json.loads(raw or '{}')
+                payload = swap_acc(data.get('client', ''), data.get('target'))
+                err = payload.get('error', '')
+                if payload.get('ok'):
+                    status = 200
+                elif err == 'invalid_client' or err == 'invalid_target' or err == 'already_active':
+                    status = 400
+                elif err.startswith('acc_not_setup'):
+                    status = 404
+                else:
+                    status = 500
+                self.send_json(payload, status)
+            except subprocess.TimeoutExpired:
+                self.send_json({'ok': False, 'error': 'swap_timeout', 'ts': time.time()}, 504)
+            except Exception as exc:
+                self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+            return
+        self.send_json({'ok': False, 'error': 'not_found'}, 404)
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        if parsed.path != '/file':
+            self.send_json({'ok': False, 'error': 'not_found'}, 404)
+            return
+        qs = parse_qs(parsed.query)
+        try:
+            payload = delete_upload(qs.get('name', [''])[0])
+            self.send_json(payload, 200 if payload.get('ok') else 400)
+        except Exception as exc:
+            self.send_json({'ok': False, 'error': str(exc), 'ts': time.time()}, 500)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+
+if __name__ == '__main__':
+    ensure_uploads_dir()
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
